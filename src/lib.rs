@@ -45,7 +45,7 @@ mod stream;
 
 use crate::audio_output::{
     init_metronome_system, metronome_events_system, play_queued_audio_system, stream_audio_system,
-    update_instance_states_system, AudioOutput, Metronome,
+    update_instance_states_system, AudioOutput,
 };
 
 #[cfg(feature = "flac")]
