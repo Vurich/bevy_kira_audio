@@ -1,8 +1,8 @@
 use crate::audio::{
     Audio, AudioCommand, AudioCommandResult, InstanceHandle, PlayAudioSettings, PlaybackState,
 };
-use bevy::prelude::*;
-use bevy::utils::tracing::warn;
+use bevy::{app::Events, prelude::*, reflect::TypeUuid, utils::tracing::warn};
+use kira::metronome::handle::MetronomeHandle;
 
 use crate::channel::AudioChannel;
 use crate::source::AudioSource;
@@ -20,7 +20,10 @@ use kira::manager::{AudioManager, AudioManagerSettings};
 use kira::mixer::TrackIndex;
 use kira::sound::handle::SoundHandle;
 use kira::CommandError;
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    ops::{Deref, DerefMut},
+};
 
 /// Non-send resource that acts as audio output
 ///
@@ -47,8 +50,34 @@ impl Default for AudioOutput {
             warn!("Failed to setup audio: {:?}", setup_error);
         }
 
+        Self::new(manager.ok())
+    }
+}
+
+#[derive(TypeUuid)]
+#[uuid = "00b3de66-d9e9-40f5-a7d8-8d0aa0e9ef03"]
+pub struct Metronome {
+    pub handle: MetronomeHandle,
+}
+
+impl Deref for Metronome {
+    type Target = MetronomeHandle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handle
+    }
+}
+
+impl DerefMut for Metronome {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.handle
+    }
+}
+
+impl AudioOutput {
+    fn new(manager: impl Into<Option<AudioManager>>) -> Self {
         Self {
-            manager: manager.ok(),
+            manager: manager.into(),
             sounds: HashMap::default(),
             arrangements: HashMap::default(),
             streams: HashMap::default(),
@@ -56,9 +85,7 @@ impl Default for AudioOutput {
             channels: HashMap::default(),
         }
     }
-}
 
-impl AudioOutput {
     fn create_or_get_sound(
         &mut self,
         audio_source: &AudioSource,
@@ -287,6 +314,7 @@ impl AudioOutput {
 
     pub(crate) fn run_queued_audio_commands(
         &mut self,
+
         audio_sources: &Assets<AudioSource>,
         audio: &mut Audio,
     ) {
@@ -470,4 +498,57 @@ pub fn update_instance_states_system(world: &mut World) {
                 .insert(instance_state.handle.clone(), playback_status);
         }
     }
+}
+
+const BEATS_IN_BAR: f64 = 4.;
+
+pub fn init_metronome_system(mut commands: Commands, mut output: NonSendMut<AudioOutput>) {
+    let manager = if let Some(m) = output.manager.as_mut() {
+        m
+    } else {
+        return;
+    };
+    let mut metronome = if let Ok(m) = manager.add_metronome(
+        kira::metronome::MetronomeSettings::new()
+            .event_queue_capacity(crate::BEAT_EVENTS.len())
+            .interval_events_to_emit(crate::BEAT_SUBDIVISIONS)
+            .tempo(kira::Tempo(120. / BEATS_IN_BAR)),
+    ) {
+        m
+    } else {
+        return;
+    };
+    metronome.stop().unwrap();
+    commands.insert_resource(Metronome { handle: metronome });
+    commands.insert_resource(Events::<crate::BeatEvent>::default())
+}
+
+pub fn metronome_events_system(
+    mut events: EventWriter<crate::BeatEvent>,
+    mut metronome: ResMut<Metronome>,
+    mut last_settings: ResMut<crate::LastTimelineSettings>,
+    settings: Res<crate::TimelineSettings>,
+) {
+    use crate::TimelineState;
+
+    if last_settings.inner != *settings {
+        last_settings.inner = settings.clone();
+
+        metronome
+            .handle
+            .set_tempo(kira::Tempo(settings.bpm / BEATS_IN_BAR))
+            .unwrap();
+        match settings.state {
+            TimelineState::Paused => metronome.pause(),
+            TimelineState::Playing => metronome.start(),
+            TimelineState::Stopped => metronome.stop(),
+        }
+        .unwrap();
+    }
+    events.send_batch(std::iter::from_fn(|| {
+        metronome
+            .pop_event()
+            .unwrap()
+            .and_then(|amt| crate::BeatEvent::from_subdivision(amt))
+    }));
 }
